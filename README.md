@@ -1,4 +1,4 @@
-# Installation Scripts
+# Deployment Kit
 
 Automated, repeatable installation of data, observability and security platforms on Linux servers.
 
