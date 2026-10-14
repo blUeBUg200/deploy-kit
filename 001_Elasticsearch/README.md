@@ -14,9 +14,9 @@ It follows Elastic's tutorial [*Install a self-managed Elastic Stack*](https://w
 
 ## Architecture
 
-![Minimal Elastic Stack architecture](elastic-stack-architecture.png)
+![Minimal Elastic Stack architecture](images/Elastic_3Node_Architecture.png)
 
-> An editable version of this diagram is in `elastic-stack-architecture.excalidraw` (open it at <https://excalidraw.com> → *Open*).
+> [Editable Architecture File](images/Elastic_3Node_Architecture.excalidraw) (open it at <https://excalidraw.com> → *Open*).
 
 | Component | Port | Who connects |
 |---|---|---|
