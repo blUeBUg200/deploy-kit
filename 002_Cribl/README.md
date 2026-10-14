@@ -1,228 +1,258 @@
-# Cribl Stream Deployment Script — `cribl-deploy.sh`
+# Cribl Stream 4.x – Distributed Leader/Worker Setup
 
-One Bash script that installs **Cribl Stream** from the official tarball (no RPM/DEB) and configures the host as a **Leader** or a **Worker** in a distributed deployment.
+`cribl-deploy.sh` installs Cribl Stream in distributed mode from the official **tar.gz (bundle) archive** — no RPM/DEB packages. You copy the one script to every VM and run it there, choosing that VM's **role**.
 
-| | |
-|---|---|
-| **Script version** | 1.5.0 |
-| **Supported OS** | Ubuntu / Debian · RHEL / Rocky / Alma / Oracle / CentOS |
-| **CPU** | x86_64 (`linux-x64`) · aarch64 (`linux-arm64`) |
-| **Install path** | `/opt/cribl` |
-| **Service** | `cribl.service` (systemd), runs as non-root user `cribl` |
-| **Reference** | [Set Up Leader and Worker Nodes](https://docs.cribl.io/stream/setting-up-leader-and-worker-nodes/) |
+The result is a distributed deployment of two VMs:
+
+- 1 × Leader
+- 1 × Worker
+
+More Workers are added by running the same script on each new VM.
+
+It follows Cribl's guide [*Set Up Leader and Worker Nodes*](https://docs.cribl.io/stream/setting-up-leader-and-worker-nodes/), adapted to bundle installs and hardened with Cribl's [*OS Tuning*](https://docs.cribl.io/stream/os-tuning/) guidance.
 
 ---
 
-## 1. What it does
+## Architecture
 
-The script runs the same stages on every host. Only the role step differs.
+![Cribl Stream Leader/Worker architecture](images/Cribl_Worker_Leader.png)
 
-| # | Stage | What happens |
+> [Editable Architecture File](images/Cribl_Worker_Leader.excalidraw) (open it at <https://excalidraw.com> → *Open*).
+
+| Component | Port | Who connects |
 |---|---|---|
-| 1 | **Detect platform** | Identifies OS family, package manager and CPU architecture. |
-| 2 | **Collect inputs** | Role, Leader host, auth token, Worker Group — from flags or interactive prompts. Leader token is auto-generated if not given. |
-| 3 | **Check prerequisites** | Looks for the Cribl bundle next to the script and for missing OS packages. If anything must be downloaded, asks once whether the host has internet; `n` stops with what is required. |
-| 4 | **Pre-flight checks** | CPU, RAM, free disk, local (non-network) filesystem, systemd, hostname resolution. Worker: tests TCP to Leader on 4200 and explains any failure. |
-| 5 | **Handle previous installs** | Detects a full or partial install (directory, service files, running processes, leftover RPM/DEB). Stops it, then **backs it up** (default) or **deletes** it. |
-| 6 | **Check ports** | Fails if a non-Cribl process holds 9000 (and 4200 on the Leader). |
-| 7 | **Time sync** | Uses existing `systemd-timesyncd` / `ntpd`, otherwise enables `chrony`. |
-| 8 | **Service account** | Creates system user `cribl` with no login shell. |
-| 9 | **OS tuning** | File / process limits, kernel network settings, Transparent Huge Pages off. Worker adds larger socket buffers and connection-tracking headroom. |
-| 10 | **Obtain bundle** | Uses the bundle from the script's directory, or downloads the latest from `cdn.cribl.io` (only after a `y`). Validates the tarball. |
-| 11 | **Install** | Extracts to `/opt/cribl`, sets ownership. On RHEL with SELinux, labels the binaries so systemd can run them. |
-| 12 | **Set role** | Leader: `cribl mode-master`. Worker: `cribl mode-worker` with Leader host, token and group. |
-| 13 | **Register service** | `cribl boot-start` + systemd override (limits, auto-restart, privileged-port permission). Starts the service. |
-| 14 | **Firewall** | Opens ports in `ufw` / `firewalld` if active. Leader: 9000, 4200. Worker: only ports passed in `--data-ports`. |
-| 15 | **Verify & summarise** | Leader: service up, 4200 listening. Worker: live session to the Leader. Prints next steps. |
-
-All output is also written to `/var/log/cribl-deploy.log`.
+| Leader UI / API | 9000/tcp | Users' browsers, admins |
+| Leader distributed management | 4200/tcp | Workers (Worker → Leader) |
+| Worker data inputs | As configured (e.g. 514/udp, 9514/tcp) | Data sources |
 
 ---
 
-## 2. What is covered
+## What the script does
 
-**Installation**
-- Tarball-based install on Ubuntu and RHEL families, x64 and arm64.
-- Offline install with no extra options: place the bundle next to the script (newest version wins).
-- Automatic cleanup of previous or partial installs, with backup or delete.
+**Security**
+- Cribl runs as a dedicated non-root `cribl` user with no login shell.
+- Leader and Worker authenticate with a shared **auth token**. The Leader generates a random token; the well-known default `criblmaster` is refused.
+- Optional TLS between Leader and Worker with your own certificate and key.
+- Privileged ports (below 1024, e.g. syslog 514) are allowed without running as root.
 
 **Distributed setup**
-- Leader configuration with a randomly generated auth token.
-- Worker configuration with Leader host, token, Worker Group (default `default`) and optional tags.
-- Optional TLS between Leader and Worker (certificate and key supplied by you).
-- Any number of Workers — rerun the Worker command on each new host.
+- The Leader is configured with `cribl mode-master`.
+- Each Worker is configured with `cribl mode-worker` and joins a **Worker Group** (default: `default`), with optional tags.
+- After the Leader install, the script prints the exact command to run on each Worker.
 
-**OS best practices**
-- Dedicated non-root service account; service runs under systemd with auto-restart.
-- Privileged ports (< 1024, e.g. syslog 514) allowed by default, without running as root.
-- Open-file limit 65536, kernel network tuning, Transparent Huge Pages disabled.
-- Worker: 25 MB socket receive buffers, larger connection-tracking table.
-- Time synchronisation, SELinux labelling on RHEL, host firewall rules.
+**Operating system tuning**
+- Open-file and process limits are raised (65536 / 16384).
+- Kernel network settings are tuned (`somaxconn`, backlog, TCP keepalive, port range).
+- Transparent Huge Pages are disabled.
+- Workers get 25 MB socket receive buffers and a larger connection-tracking table for high-rate ingest.
+- Time sync is enabled (existing `systemd-timesyncd`/`ntpd`, or chrony).
+- A systemd service is created with automatic restart.
 
-**Safety**
-- Prerequisite check before any change; asks before downloading anything, and stops cleanly on `n`.
-- Refuses the well-known default token `criblmaster`.
-- Refuses network storage (NFS/CIFS/EFS) for the install directory.
-- Process detection by executable, so unrelated processes are never stopped.
+**Prerequisites**
+- OS packages and the Cribl bundle are checked before anything on the host changes.
+- If anything must be downloaded, the script asks once whether the host has internet access. Answering `n` stops the script with an exact list of what is required.
 
----
+**Reinstalls**
+- Previous or partial installs (install directory, service files, running processes, leftover RPM/DEB) are detected and stopped.
+- The old install is **backed up** by default, or deleted on request.
 
-## 3. What is not covered
+**Firewall**
+- Only the required ports are opened in firewalld or ufw.
+- Leader: 9000 and 4200. Worker: only the data ports you specify.
 
-| Area | Notes |
-|---|---|
-| Leader high availability / failover | Single Leader only. |
-| Creating Worker Groups | Create non-default groups in the Leader UI **before** installing Workers that use them. |
-| Admin password | First login is `admin` / `admin`; change it manually. |
-| TLS certificates | Not generated. Supply PEM certificate and key with `--tls-cert` / `--tls-key`. |
-| Licensing | Apply your license in the Leader UI. |
-| Data configuration | Sources, Destinations, Routes, Pipelines, Packs. |
-| Commit & deploy | Run from the Leader UI after Workers join. |
-| Git remote / version control | Local git only (installed on the Leader). |
-| Network outside the host | Hypervisor, cloud security groups, network firewalls, load balancers. |
-| Upgrades | A rerun installs fresh and backs up the old copy; it does not migrate configuration. |
-| Other platforms | Cribl Edge, Docker, Kubernetes, Windows. |
-| Proxy for Cribl itself | The script's downloads honour `https_proxy`; Cribl's runtime proxy is configured separately. |
+**Platform**
+- SELinux labels are set on RHEL-family hosts where enforcing.
+
+**Downloads**
+- The bundle is validated before installation.
+- Air-gapped use is supported: place the bundle next to the script.
 
 ---
 
-## 4. Prerequisites check: OS packages and Cribl bundle (automatic)
+## Requirements
 
-Runs first, before anything on the host is changed. There are no options for it.
+**VMs (minimal sizing)**
 
-| Situation | What the script does |
-|---|---|
-| Bundle in the script's directory, all OS packages present | Proceeds. **Nothing is downloaded**, no question asked. |
-| Bundle in the script's directory, OS packages missing | Asks: *Does this host have internet access to download them? [y/n]* |
-| No bundle in the script's directory | Asks the same question (the bundle would come from `cdn.cribl.io`). |
-| Both missing | Lists both and asks the question **once**. |
-
-| Answer | Result |
-|---|---|
-| `y` | Installs the missing OS packages now; downloads the bundle at the install step. |
-| `n` | Stops and states what is required: *"These OS packages are required to proceed: …"* with the install command, and/or *"The Cribl Stream package is required to proceed"* with where to put the file. |
-
-**Bundle rules:** file must be `cribl-<ver>-<build>-linux-<arch>.tgz` in the **same directory as the script**, under its original name. If several versions are there, the newest is used. Bundles for the other CPU type, Cribl Edge bundles (`cribl-edge-*`) and renamed files are ignored with a warning.
-
-**No terminal** (for example, run from automation): the question cannot be asked, so it is treated as `n` and the script stops with the same message. The general `--yes` flag answers `y`.
-
----
-
-## 5. Prerequisites
-
-| Item | Leader | Worker |
+| VM | Role | Suggested sizing |
 |---|---|---|
-| Access | `root` or `sudo` | `root` or `sudo` |
-| Sizing (production) | 4+ vCPU, 8+ GB RAM | 4+ vCPU, 8+ GB RAM |
-| Free disk on `/opt` | 5 GB minimum, local disk | 5 GB minimum, local disk |
-| Inbound ports | 9000/tcp (UI), 4200/tcp (Workers) | Your data ports only |
-| Outbound | — | Leader on 4200/tcp |
-| Bundle | Internet to `cdn.cribl.io`, **or** the `.tgz` next to the script | Same |
+| VM 1 | `leader` | 4+ vCPU, 8+ GB RAM, 5+ GB free on `/opt` |
+| VM 2 | `worker` | 4+ vCPU, 8+ GB RAM, 5+ GB free on `/opt` |
 
-Lower sizing only warns, so labs work.
+Smaller VMs only produce a warning, so lab hosts work.
+
+**Software and access**
+- **Linux distribution:** one of these OS families:
+  - `debian` (Debian/Ubuntu)
+  - `rhel` (RHEL/Rocky/Alma/Oracle/CentOS)
+- **CPU:** x86_64 or aarch64.
+- **Base tools:** systemd, bash 4+.
+- **Privileges:** root via `sudo` on each VM.
+- **Local disk** for the install directory (`/opt/cribl`). Network storage (NFS/CIFS/EFS) is refused.
+- **Internet access to `cdn.cribl.io`**, or the bundle `cribl-<version>-<build>-linux-<arch>.tgz` placed next to the script under its original name.
+- **Network:** Workers must reach the Leader on 4200/tcp; browsers must reach the Leader on 9000/tcp.
+- **Same values on every VM:** auth token and Leader port. Workers must run the **same Cribl version as the Leader, or older** — never newer.
 
 ---
 
-## 6. How to run — 1 Leader + 1 Worker
+## Roles
 
-Example hosts:
-
-| Role | Hostname | IP |
+| Role | Run on | Purpose |
 |---|---|---|
-| Leader | `cribl-leader01` | `192.168.55.55` |
-| Worker | `cribl-worker01` | `192.168.55.56` |
+| `leader` | Leader VM | Installs the Leader. Prints the **UI URL**, the **auth token** and the ready-made Worker command. |
+| `worker` | Each Worker VM | Installs a Worker and connects it to the Leader in the chosen Worker Group. |
 
-### Step 1 — Copy files to both hosts
-```bash
-scp cribl-deploy.sh cribl-4.20.2-7199aa90-linux-x64.tgz user@192.168.55.55:/tmp/
-scp cribl-deploy.sh cribl-4.20.2-7199aa90-linux-x64.tgz user@192.168.55.56:/tmp/
-```
-**Offline:** keep the `.tgz` in the same directory as the script, under its original name — it is used automatically. **Online:** copy only the script; the latest bundle is downloaded.
+Run `sudo ./cribl-deploy.sh` with no options to choose the role from a menu.
 
-On each host:
+---
+
+## Installation steps
+
+Example IPs used below: Leader `192.168.55.55`, Worker `192.168.55.56`.
+
+### Step 0 – Copy the script to every VM
+
 ```bash
-cd /tmp && chmod +x cribl-deploy.sh
+for h in 192.168.55.55 192.168.55.56; do
+  scp cribl-deploy.sh <user>@$h:~/cribl-scripts/
+done
+# on each VM
+chmod +x ~/cribl-scripts/cribl-deploy.sh
 ```
 
-### Step 2 — Optional dry run
+For an air-gapped install, copy the bundle (`cribl-<version>-<build>-linux-<arch>.tgz`) into the same folder. Use the **same bundle** on the Leader and every Worker.
+
+Optional dry run, which changes nothing:
+
 ```bash
 sudo ./cribl-deploy.sh --precheck
 ```
-Reports dependencies, sizing and any previous install. Changes nothing.
 
-### Step 3 — Install the Leader (`192.168.55.55`)
+### Step 1 – Leader
+
 ```bash
+cd ~/cribl-scripts
 sudo ./cribl-deploy.sh --role leader
 ```
-At the end, the summary shows the **UI URL**, the **auth token** and the exact Worker command. Store the token securely.
 
-### Step 4 — Prepare the Leader UI
+You will be asked only if something is missing:
+- whether the host has internet access to download missing OS packages or the bundle
+- how to handle a previous install, if one is found (back up, delete, or abort)
+
+**Record from the output** (also in `/var/log/cribl-deploy.log`):
+- the **UI URL**
+- the **auth token**
+- the ready-made **Worker command**
+
+### Step 2 – Prepare the Leader UI
+
 1. Open `http://192.168.55.55:9000` and log in as `admin` / `admin`.
-2. Change the admin password.
-3. Only if not using `default`: **Worker Groups → Add** the group.
+2. Change the `admin` password.
+3. Only if not using `default`: open **Worker Groups** and add the group.
 
-### Step 5 — Install the Worker (`192.168.55.56`)
-Paste the command from the Leader summary:
+### Step 3 – Worker
+
 ```bash
 sudo ./cribl-deploy.sh --role worker \
      --leader-host 192.168.55.55 \
      --token '<AUTH_TOKEN>' \
      --group default
 ```
-Optional: `--data-ports "514/udp,514/tcp"` to open inbound data ports, `--tags "dc1,linux"` to tag the Worker.
 
-### Step 6 — Verify and deploy
-1. Leader UI → **Workers**: `cribl-worker01` appears in its group.
-2. Open the group → **Commit** → **Deploy**.
+Paste the command from Step 1. If options are omitted, you will be asked for the Leader host, the auth token and the Worker Group.
 
-To scale out, repeat Step 5 on each new Worker host.
+> **Tip – open data ports at install time:** add `--data-ports "514/udp,514/tcp"` to open the Worker's inbound ports in the host firewall.
 
----
+### Step 4 – Commit and deploy
 
-## 7. Common options
+Workers only pull their configuration after it is deployed to their group.
 
-| Need | Flag |
-|---|---|
-| Interactive mode | run with no flags |
-| Worker: install before the Leader is reachable | `--skip-leader-check` |
-| Reinstall, delete old copy | `--reinstall-mode clean` |
-| Backup location | `--backup-dir /data/cribl-backups` |
-| Unattended (answers `y` to every question, including downloads) | `--yes` |
-| TLS (Leader) | `--tls --tls-cert leader.crt --tls-key leader.key` |
-| TLS (Worker) | `--tls` |
-| Do not allow ports < 1024 | `--no-low-ports` |
-| Skip firewall / OS tuning | `--skip-firewall` / `--skip-os-tuning` |
-| Remove Cribl | `--uninstall` |
-| All options | `--help` |
+1. In the Leader UI, open **Worker Groups → default**.
+2. Select **Commit**, then **Deploy**.
 
 ---
 
-## 8. Files and changes on the host
+## Verify the installation
 
-| Path | Purpose |
+```bash
+# On each VM: mode, status, version and Leader address
+sudo -u cribl /opt/cribl/bin/cribl status
+
+# On the Leader: the Worker's connection on 4200
+sudo ss -tn state established '( sport = :4200 )'
+```
+
+Then:
+1. Open `http://192.168.55.55:9000` and log in.
+2. In **Workers**, the Worker should be **green**, with the deployed **Config Version**. If it still shows loading after a deploy, hard-refresh the browser (Ctrl+Shift+R).
+3. In **Worker Groups**, the group should show no pending deploy.
+
+**Adding more Workers:**
+1. Copy the script (and the same bundle, if air-gapped) to the new VM.
+2. Run the Worker command from Step 3.
+3. Confirm the Worker appears in **Workers**.
+
+---
+
+## Command-line options
+
+| Option | Description |
 |---|---|
-| `/opt/cribl` | Cribl installation |
-| `/opt/cribl-backups/cribl-<timestamp>/` | Previous install (backup mode) |
-| `/etc/systemd/system/cribl.service` | Service unit (from `cribl boot-start`) |
+| `--role <role>` | `leader` or `worker`. If omitted, a menu is shown. |
+| `--leader-host <host>` | Worker: Leader IP or FQDN. |
+| `--token <value>` | Auth token. Leader: generated if omitted. Worker: required (prompted if omitted). |
+| `--group <name>` | Worker Group to join (default: `default`). |
+| `--tags <t1,t2>` | Worker tags reported to the Leader. |
+| `--data-ports <list>` | Worker: inbound ports to open, e.g. `514/udp,9514/tcp`. |
+| `--tls`, `--tls-cert <file>`, `--tls-key <file>` | TLS between Leader and Worker. The Leader needs the certificate and key; Workers need `--tls` only. |
+| `--reinstall-mode <backup\|clean>` | Handling of a previous install (default: `backup`). |
+| `--skip-leader-check` | Worker: install even if the Leader is not reachable yet. |
+| `--yes` | Unattended run; answers yes to every question, including downloads. |
+| `--precheck` | Run all checks and change nothing. |
+| `--uninstall` | Stop, disable and remove Cribl from the VM. |
+| `-h`, `--help` | Show all options, including paths, ports and tuning switches. |
+
+---
+
+## Files and directories
+
+| Path | Content |
+|---|---|
+| `/opt/cribl` | Cribl binaries, configuration (`local/`) and state |
+| `/opt/cribl/local/_system/instance.yml` | Distributed mode settings (Leader or Worker) |
+| `/opt/cribl/log/cribl.log` | Cribl logs |
+| `/opt/cribl-backups/cribl-<timestamp>/` | Previous install, when backed up |
+| `/etc/systemd/system/cribl.service` | Service unit |
 | `/etc/systemd/system/cribl.service.d/override.conf` | Limits, restart policy, privileged-port permission |
 | `/etc/systemd/system/disable-thp.service` | Disables Transparent Huge Pages at boot |
-| `/etc/sysctl.d/99-cribl.conf`, `99-cribl-conntrack.conf` | Kernel tuning |
-| `/etc/security/limits.d/99-cribl.conf` | User limits for `cribl` |
-| `/var/log/cribl-deploy.log` | Script log |
+| `/etc/sysctl.d/99-cribl*.conf` | Kernel tuning |
+| `/etc/security/limits.d/99-cribl.conf` | Limits for the `cribl` user |
+| `/var/log/cribl-deploy.log` | Full log of every run |
+
+Services: `systemctl status cribl`
 
 ---
 
-## 9. Troubleshooting
+## Troubleshooting
 
-| Symptom | Check |
+| Symptom | Cause / fix |
 |---|---|
-| Worker: `Cannot connect to Leader <ip>:4200` | The script prints the cause (refused, timeout, no route, DNS). On the Leader: `systemctl status cribl`, `ss -ltnp \| grep 4200` (expect `0.0.0.0:4200`), `ufw status` / `firewall-cmd --list-ports`. From the Worker: `nc -vz <leader-ip> 4200`. On a terminal you can choose to continue; unattended, add `--skip-leader-check`. |
-| Bundle was downloaded instead of the local file | File must be in the **script's** directory, keep its original name, and match the CPU (`linux-x64` / `linux-arm64`). The log shows `Ignoring <file>: <reason>`. |
-| "The Cribl Stream package is required to proceed" | Copy `cribl-<ver>-<build>-linux-<arch>.tgz` next to the script and re-run. |
-| "These OS packages are required to proceed" | Run the printed `apt-get install` / `dnf install` command, or copy the packages from a connected host. |
-| Answered `y` but repositories or `cdn.cribl.io` unreachable | Script stops with the same "required" message; check proxy, DNS and firewall, or provide the files locally. |
-| Service does not start | `journalctl -u cribl -n 100`, `/opt/cribl/log/cribl.log` |
-| Worker not in expected group | Group must exist on the Leader; then Commit & Deploy. |
-| Port 9000 / 4200 in use | Stop the other process, or `--force`. |
+| "The Cribl Stream package is required to proceed" | No bundle next to the script and you answered `n`. Copy `cribl-<version>-<build>-linux-<arch>.tgz` into the script's folder under its original name and run again. |
+| "These OS packages are required to proceed" | Missing packages and you answered `n`. Run the printed `apt-get` / `dnf` command, or copy the packages from a connected host. |
+| Bundle downloaded instead of the local file | The file must be in the **script's** folder, keep its original name and match the CPU (`linux-x64` / `linux-arm64`). The log shows `Ignoring <file>: <reason>`. |
+| Worker: "Cannot connect to Leader … :4200" | The script prints the cause (refused, timeout, no route, DNS). On the Leader: `systemctl status cribl` and `ss -ltnp \| grep 4200` (expect `0.0.0.0:4200`); check the firewall. From the Worker: `timeout 3 bash -c '</dev/tcp/<leader-ip>/4200' && echo open` |
+| Worker connected but still loading | The group has not been deployed. Commit and deploy it (Step 4), then hard-refresh the browser (Ctrl+Shift+R). |
+| Worker not in the expected group | The group must exist on the Leader before the Worker joins. Create it, then commit and deploy. |
+| Worker misbehaves after joining | Check versions on both VMs with `cribl version`. A Worker must not be newer than the Leader; reinstall the Worker with the Leader's bundle. |
+| Service fails at start-up | Check `journalctl -u cribl -n 100` and `/opt/cribl/log/cribl.log`. |
 
-Logs: `/var/log/cribl-deploy.log` (script) · `/opt/cribl/log/cribl.log` (Cribl).
+---
+
+## Notes and limitations
+
+- **Single Leader.** No Leader high availability or failover.
+- **UI over HTTP.** The Leader UI on 9000 is plain HTTP by default. Enable TLS for the UI in Cribl's settings for production.
+- **Leader–Worker channel.** Unencrypted unless `--tls` is used. Certificates are not generated by the script.
+- **Default credentials.** Change the `admin` / `admin` password immediately after the first login.
+- **Reinstalls, not upgrades.** A rerun installs fresh and backs up the old copy; configuration is not migrated.
+- **Version order.** Upgrade the Leader before Workers. Workers may be one minor version behind the Leader, never ahead.
+- **Out of scope.** Licensing, Sources, Destinations, Routes, Pipelines and Packs are configured in the Leader UI.
