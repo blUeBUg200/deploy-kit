@@ -160,6 +160,17 @@ directly, to put it back.
 `CAP_NET_RAW` only grants raw socket access, nothing more. macOS doesn't
 support Linux capabilities, so it needs `sudo` there instead.
 
+The script checks itself for Windows style (CRLF) line endings every time it
+runs and fixes itself on the fly if it finds any, which happens if the file
+passed through a Windows machine somewhere along the way (an email
+attachment, a copy and paste through a certain editor, that kind of thing).
+There's one case it can't fix on its own: if you run it as `./udp-sender.sh
+install` and even the very first line is affected, the kernel rejects the
+file before bash gets a chance to run and self correct, usually with an
+error mentioning `bash\r`. If you see that, just run `bash udp-sender.sh
+install` once instead (which it can fix on its own), or clean the file
+yourself first with `sed -i 's/\r$//' udp-sender.sh`.
+
 Worth knowing: the upstream `packet-generator.go` carries a build tag that
 excludes it from a normal build, and it also depends on a constant defined
 elsewhere in the package. Running it the way the upstream README describes

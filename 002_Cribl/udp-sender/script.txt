@@ -37,6 +37,33 @@
 #
 # Run `./udp-sender.sh <command> -h` for per-command options.
 #
+# Self heal: if this file picked up Windows style (CRLF) line endings
+# somewhere along the way (a Windows-touched download, copy paste through
+# an editor, an email attachment, etc.), each line ends with an invisible
+# carriage return. That alone doesn't stop bash from reading the file, but
+# it silently corrupts tokens like `pipefail` into `pipefail` plus a
+# trailing carriage return, which bash then rejects with a confusing
+# "invalid option name" error on the very next line. Rather than require a
+# manual fix, detect that condition here and correct it automatically
+# before anything else runs.
+# Written as ONE line with brace grouping, not if/then/fi: a CRLF corrupted
+# file adds a carriage return to the end of every line, including this one,
+# and a multi line if/then/fi block breaks the moment "then" or "fi" picks
+# up that extra character. It also ends in a trailing comment on purpose:
+# that stray carriage return still lands at the very end of the line, so
+# putting a harmless comment there means it lands inside the comment
+#
+# One honest limit: this only helps once bash is actually reading the file,
+# so it covers `bash udp-sender.sh install`. If you instead run it as
+# `./udp-sender.sh install` and the very first line has also picked up a
+# trailing carriage return, the kernel itself rejects it before bash ever
+# gets a chance to run, with something like "bash\r: No such file or
+# directory". No code inside the file can catch that case, since the
+# kernel never reaches it; if you see that specific error, just run
+# `bash udp-sender.sh install` once instead, or strip the file with
+# `sed -i 's/\r$//' udp-sender.sh` first.
+# instead of gluing itself onto the closing brace right before it.
+LC_ALL=C grep -q $'\r' "${BASH_SOURCE[0]:-$0}" 2>/dev/null && { clean_copy="$(mktemp)"; sed 's/\r$//' "${BASH_SOURCE[0]:-$0}" > "$clean_copy"; chmod +x "$clean_copy"; exec bash "$clean_copy" "$@"; } #
 set -euo pipefail
 
 REPO="criblio/udp-sender"
