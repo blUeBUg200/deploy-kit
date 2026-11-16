@@ -1,0 +1,424 @@
+#!/usr/bin/env bash
+#
+# udp-sender.sh : install and run criblio/udp-sender.
+#
+# Commands:
+#   install    (default) Install the binary, online or air gapped, and apply
+#              every piece of setup it needs in one pass: the udp-senders
+#              group, ownership and permissions, the CAP_NET_RAW capability,
+#              and, if a systemd service such as Cribl is already present,
+#              the service account's group membership plus the CAP_NET_RAW
+#              systemd drop-in that lets that service spawn the binary
+#              without hitting EACCES or EPERM. This step is a no-op when no
+#              such service exists, so it's safe to run anywhere.
+#   send       Send UDP packets with a spoofed source IP using CAP_NET_RAW
+#              (no sudo needed at send time).
+#   help       Show this help.
+#
+# Install behaves the same whether the host is online or air gapped. It
+# looks for an artifact staged next to this script first (no flag needed),
+# and only reaches out to GitHub if nothing is staged and the host can
+# actually reach it.
+#
+# Examples:
+#   sudo ./udp-sender.sh install                 # just run it; same folder is checked automatically
+#   sudo ./udp-sender.sh install -d ./artifacts  # or point it at another folder if you prefer
+#   ./udp-sender.sh send -s 203.0.113.55 -D 10.20.30.40 -P 514 -c 100
+#
+# install options:
+#   -d, --artifact-dir DIR   Directory with a staged .deb/.rpm/binary/source.
+#   -V, --version vX.Y.Z     Release version (for a GitHub download).
+#   -m, --method METHOD      auto|package|binary|source (default: auto).
+#   -b, --bin-dir DIR        Install location (default: /usr/bin).
+#   -u, --user NAME          User added to the udp-senders group.
+#   --service NAME           systemd unit to integrate with (default:
+#                            auto-detect a *cribl* unit; skipped if none).
+#   --no-restart             Apply service fixes without restarting it.
+#
+# Run `./udp-sender.sh <command> -h` for per-command options.
+#
+set -euo pipefail
+
+REPO="criblio/udp-sender"
+BIN_NAME="udp-sender"
+GROUP_NAME="udp-senders"
+BINARY="/usr/bin/udp-sender"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+log()  { printf '%s\n' "$*"; }
+info() { printf '  %s\n' "$*"; }
+ok()   { printf '  \033[32m✓\033[0m %s\n' "$*"; }
+warn() { printf '  \033[33m!\033[0m %s\n' "$*" >&2; }
+die()  { printf '\033[31mERROR:\033[0m %s\n' "$*" >&2; exit 1; }
+
+print_block() { awk 'NR==1{next} /^[^#]/{exit} {sub(/^# ?/,""); print}' "${BASH_SOURCE[0]}"; }
+need_root()   { [[ "$(id -u)" -eq 0 ]] || die "Must run as root. Re-run with sudo."; }
+
+detect_arch() {
+    case "$(uname -m)" in
+        x86_64|amd64)  ARCH_PKG="x64";   ARCH_BIN="x64" ;;
+        aarch64|arm64) ARCH_PKG="arm64"; ARCH_BIN="arm64" ;;
+        *) die "Unsupported architecture: $(uname -m)" ;;
+    esac
+}
+detect_pkgkind() {
+    PKG_KIND=""
+    if command -v dpkg >/dev/null 2>&1 && command -v apt-get >/dev/null 2>&1; then PKG_KIND="deb"
+    elif command -v rpm >/dev/null 2>&1; then PKG_KIND="rpm"; fi
+}
+
+# ============================== INSTALL ====================================
+cmd_install() {
+    local ARTIFACT_DIR="" VERSION="" METHOD="auto" BIN_DIR="/usr/bin"
+    local TARGET_USER="${SUDO_USER:-$(id -un)}" SERVICE="" DO_RESTART=1
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -d|--artifact-dir) ARTIFACT_DIR="${2:?}"; shift 2 ;;
+            -V|--version)      VERSION="${2:?}";      shift 2 ;;
+            -m|--method)       METHOD="${2:?}";       shift 2 ;;
+            -b|--bin-dir)      BIN_DIR="${2:?}";      shift 2 ;;
+            -u|--user)         TARGET_USER="${2:?}";  shift 2 ;;
+            --service)         SERVICE="${2:?}";      shift 2 ;;
+            --no-restart)      DO_RESTART=0;          shift ;;
+            -h|--help)         print_block; return 0 ;;
+            *) die "install: unknown option $1" ;;
+        esac
+    done
+    [[ "$(uname -s)" == "Linux" ]] || die "Linux only."
+    need_root
+    BINARY="$BIN_DIR/$BIN_NAME"
+    detect_arch; detect_pkgkind
+
+    SEARCH_DIRS=(); [[ -n "$ARTIFACT_DIR" ]] && SEARCH_DIRS+=("$ARTIFACT_DIR"); SEARCH_DIRS+=("$SCRIPT_DIR" "$PWD")
+
+    log "udp-sender install"
+    log "────────────────────────────────────────────────────────"
+    info "Architecture : $(uname -m) (pkg:$ARCH_PKG bin:$ARCH_BIN)"
+    info "Package type : ${PKG_KIND:-none}"
+    info "Install dir  : $BIN_DIR"
+    info "Method       : $METHOD"
+    log "────────────────────────────────────────────────────────"
+
+    INSTALL_VERSION="$VERSION" INSTALL_METHOD="$METHOD" INSTALL_BINDIR="$BIN_DIR" \
+    INSTALL_USER="$TARGET_USER" select_and_install
+
+    # Service integration: make a systemd service (e.g. Cribl) able to spawn
+    # the binary. No-op when no such service is present.
+    apply_service_integration "$SERVICE" "$DO_RESTART"
+
+    log "────────────────────────────────────────────────────────"
+    log "Install complete."
+    command -v getcap >/dev/null 2>&1 && info "Capability: $(getcap "$BINARY" 2>/dev/null || echo none)"
+    info "Members of '$GROUP_NAME' may run $BIN_NAME. Re-login or 'newgrp $GROUP_NAME' to pick up the group."
+}
+
+find_artifact() {
+    local pattern="$1" dir match
+    for dir in "${SEARCH_DIRS[@]}"; do
+        [[ -d "$dir" ]] || continue
+        # shellcheck disable=SC2086
+        match="$(ls -1 "$dir"/$pattern 2>/dev/null | head -n1 || true)"
+        [[ -n "$match" ]] && { printf '%s\n' "$match"; return 0; }
+    done
+    return 1
+}
+find_binary_artifact() {
+    local dir f
+    for dir in "${SEARCH_DIRS[@]}"; do
+        [[ -d "$dir" ]] || continue
+        while IFS= read -r f; do
+            [[ -n "$f" ]] || continue
+            case "$f" in *.sha256|*.tar.gz|*.tgz|*.deb|*.rpm) continue ;; esac
+            [[ -f "$f" ]] || continue
+            if [[ -x "$f" ]] || file "$f" 2>/dev/null | grep -qi 'ELF\|executable'; then printf '%s\n' "$f"; return 0; fi
+        done < <(ls -1 "$dir"/${BIN_NAME}*linux-${ARCH_BIN}* "$dir"/${BIN_NAME}-${ARCH_BIN} "$dir"/${BIN_NAME} 2>/dev/null)
+    done
+    return 1
+}
+find_source_dir() {
+    local dir
+    for dir in "${SEARCH_DIRS[@]}" "$SCRIPT_DIR/udp-sender" "$PWD/udp-sender"; do
+        [[ -f "$dir/go.mod" && -f "$dir/main.go" ]] || continue
+        grep -q "module github.com/$REPO" "$dir/go.mod" 2>/dev/null && { printf '%s\n' "$dir"; return 0; }
+    done
+    return 1
+}
+github_reachable() {
+    if command -v curl >/dev/null 2>&1; then curl -fsS --max-time 5 -o /dev/null "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null
+    elif command -v wget >/dev/null 2>&1; then wget -q -T 5 -t 1 -O /dev/null "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null
+    else return 1; fi
+}
+download() {
+    local url="$1" out="$2"
+    if command -v curl >/dev/null 2>&1; then curl -fSL --retry 3 -o "$out" "$url"
+    elif command -v wget >/dev/null 2>&1; then wget -O "$out" "$url"
+    else die "Need curl or wget to download $url"; fi
+}
+resolve_latest_version() {
+    local tag=""
+    if command -v curl >/dev/null 2>&1; then
+        tag="$(curl -fsS "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null | grep -m1 '"tag_name"' | sed -E 's/.*"tag_name": *"([^"]+)".*/\1/')"
+    elif command -v wget >/dev/null 2>&1; then
+        tag="$(wget -qO- "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null | grep -m1 '"tag_name"' | sed -E 's/.*"tag_name": *"([^"]+)".*/\1/')"
+    fi
+    [[ -n "$tag" ]] && printf '%s\n' "$tag"
+}
+verify_checksum() {
+    local file="$1" sumfile="$2"
+    [[ -f "$sumfile" ]] || { warn "No checksum for $(basename "$file"); skipping."; return 0; }
+    command -v sha256sum >/dev/null 2>&1 || { warn "sha256sum missing; skipping verify."; return 0; }
+    ( cd "$(dirname "$file")" && sha256sum -c "$(basename "$sumfile")" ) || die "Checksum failed: $(basename "$file")"
+    ok "Checksum verified: $(basename "$file")"
+}
+ensure_group() {
+    getent group "$GROUP_NAME" >/dev/null 2>&1 && ok "Group '$GROUP_NAME' exists" || { groupadd -r "$GROUP_NAME"; ok "Created group '$GROUP_NAME'"; }
+}
+configure_binary() {
+    local path="$1"
+    chown "root:$GROUP_NAME" "$path"; chmod 750 "$path"
+    ok "Set root:$GROUP_NAME mode 750 on $path"
+    if command -v setcap >/dev/null 2>&1; then
+        setcap cap_net_raw+ep "$path" 2>/dev/null && ok "Granted CAP_NET_RAW on $path" || warn "setcap failed; run: sudo setcap cap_net_raw+ep $path"
+    else warn "setcap not found (libcap2-bin/libcap); capability not set."; fi
+}
+add_user_to_group() {
+    local user="$1"
+    [[ -n "$user" && "$user" != "root" ]] || { info "Skipping group membership for '$user'."; return 0; }
+    id -nG "$user" 2>/dev/null | tr ' ' '\n' | grep -qx "$GROUP_NAME" && ok "User '$user' already in '$GROUP_NAME'" \
+        || { usermod -aG "$GROUP_NAME" "$user"; ok "Added '$user' to '$GROUP_NAME'"; }
+}
+install_from_package() {
+    local pkg="$1" sum="${1}.sha256"; [[ -f "$sum" ]] && verify_checksum "$pkg" "$sum"
+    log "Installing package: $(basename "$pkg")"
+    if [[ "$pkg" == *.deb ]]; then dpkg -i "$pkg" || { apt-get -f install -y 2>/dev/null && dpkg -i "$pkg"; }
+    else rpm -Uvh --replacepkgs "$pkg" 2>/dev/null || rpm -i "$pkg"; fi
+    ok "Package installed (postinstall set group, permissions, capability)"
+    add_user_to_group "$INSTALL_USER"
+}
+install_from_binary() {
+    local bin="$1" sum
+    if [[ "$bin" == *.tar.gz || "$bin" == *.tgz ]]; then
+        sum="${bin}.sha256"; [[ -f "$sum" ]] && verify_checksum "$bin" "$sum"
+        local tmp; tmp="$(mktemp -d)"; tar -xzf "$bin" -C "$tmp"
+        bin="$(find "$tmp" -type f -name "${BIN_NAME}*" ! -name '*.sha256' | head -n1)"
+        [[ -n "$bin" ]] || die "No $BIN_NAME in archive."
+    else sum="${bin}.sha256"; [[ -f "$sum" ]] && verify_checksum "$bin" "$sum"; fi
+    install -d "$INSTALL_BINDIR"; install -m 0755 "$bin" "$INSTALL_BINDIR/$BIN_NAME"
+    ok "Installed binary to $INSTALL_BINDIR/$BIN_NAME"
+    ensure_group; configure_binary "$INSTALL_BINDIR/$BIN_NAME"; add_user_to_group "$INSTALL_USER"
+}
+install_from_source() {
+    local src="$1"; command -v go >/dev/null 2>&1 || die "Go not found; cannot build from source."
+    log "Building from source: $src"
+    local out="$src/$BIN_NAME" ldflags=""; [[ -n "$INSTALL_VERSION" ]] && ldflags="-X main.Version=$INSTALL_VERSION"
+    ( cd "$src" && CGO_ENABLED=0 go build -ldflags "$ldflags" -o "$out" . )
+    ok "Build complete"
+    install -d "$INSTALL_BINDIR"; install -m 0755 "$out" "$INSTALL_BINDIR/$BIN_NAME"
+    ok "Installed binary to $INSTALL_BINDIR/$BIN_NAME"
+    ensure_group; configure_binary "$INSTALL_BINDIR/$BIN_NAME"; add_user_to_group "$INSTALL_USER"
+}
+install_from_github() {
+    github_reachable || die \
+"No local artifacts found and GitHub is not reachable.
+This looks like an air-gapped host. Stage one of these next to the script
+(or pass its directory with -d), then re-run:
+  • package : ${BIN_NAME}-<ver>-${ARCH_PKG}.${PKG_KIND:-deb|rpm} (+ .sha256)
+  • binary  : ${BIN_NAME}-<ver>-linux-${ARCH_BIN}.tar.gz          (+ .sha256)
+  • source  : the ${REPO##*/} checkout (needs Go)"
+    [[ -n "$INSTALL_VERSION" ]] || INSTALL_VERSION="$(resolve_latest_version || true)"
+    [[ -n "$INSTALL_VERSION" ]] || die "Could not determine version; pass -V vX.Y.Z"
+    log "Fetching $REPO $INSTALL_VERSION from GitHub"
+    local tmp base url num="${INSTALL_VERSION#v}"; tmp="$(mktemp -d)"; base="https://github.com/$REPO/releases/download/$INSTALL_VERSION"
+    if [[ "$PKG_KIND" == "deb" ]]; then
+        url="$base/${BIN_NAME}-${num}-${ARCH_PKG}.deb"
+        if download "$url" "$tmp/pkg.deb" 2>/dev/null; then
+            download "${url}.sha256" "$tmp/pkg.deb.sha256" 2>/dev/null && awk '{print $1"  pkg.deb"}' "$tmp/pkg.deb.sha256" > "$tmp/s" && mv "$tmp/s" "$tmp/pkg.deb.sha256" || true
+            install_from_package "$tmp/pkg.deb"; return; fi
+    elif [[ "$PKG_KIND" == "rpm" ]]; then
+        url="$base/${BIN_NAME}-${num}-${ARCH_PKG}.rpm"
+        if download "$url" "$tmp/pkg.rpm" 2>/dev/null; then
+            download "${url}.sha256" "$tmp/pkg.rpm.sha256" 2>/dev/null && awk '{print $1"  pkg.rpm"}' "$tmp/pkg.rpm.sha256" > "$tmp/s" && mv "$tmp/s" "$tmp/pkg.rpm.sha256" || true
+            install_from_package "$tmp/pkg.rpm"; return; fi
+    fi
+    url="$base/${BIN_NAME}-${INSTALL_VERSION}-linux-${ARCH_BIN}.tar.gz"
+    download "$url" "$tmp/${BIN_NAME}.tar.gz"
+    download "${url}.sha256" "$tmp/${BIN_NAME}.tar.gz.sha256" 2>/dev/null && awk -v f="${BIN_NAME}.tar.gz" '{print $1"  "f}' "$tmp/${BIN_NAME}.tar.gz.sha256" > "$tmp/s" && mv "$tmp/s" "$tmp/${BIN_NAME}.tar.gz.sha256" || true
+    install_from_binary "$tmp/${BIN_NAME}.tar.gz"
+}
+select_and_install() {
+    local artifact src
+    case "$INSTALL_METHOD" in
+        package)
+            if [[ "$PKG_KIND" == "deb" ]] && artifact="$(find_artifact "${BIN_NAME}-*-${ARCH_PKG}.deb")"; then install_from_package "$artifact"; return
+            elif [[ "$PKG_KIND" == "rpm" ]] && artifact="$(find_artifact "${BIN_NAME}-*-${ARCH_PKG}.rpm")"; then install_from_package "$artifact"; return; fi
+            install_from_github; return ;;
+        binary)
+            if artifact="$(find_artifact "${BIN_NAME}-*-linux-${ARCH_BIN}.tar.gz")" || artifact="$(find_binary_artifact)"; then install_from_binary "$artifact"; return; fi
+            install_from_github; return ;;
+        source)
+            src="$(find_source_dir)" || die "No source tree for method source."; install_from_source "$src"; return ;;
+    esac
+    # auto
+    if [[ "$PKG_KIND" == "deb" ]] && artifact="$(find_artifact "${BIN_NAME}-*-${ARCH_PKG}.deb")"; then log "Found local .deb"; install_from_package "$artifact"; return; fi
+    if [[ "$PKG_KIND" == "rpm" ]] && artifact="$(find_artifact "${BIN_NAME}-*-${ARCH_PKG}.rpm")"; then log "Found local .rpm"; install_from_package "$artifact"; return; fi
+    if artifact="$(find_artifact "${BIN_NAME}-*-linux-${ARCH_BIN}.tar.gz")"; then log "Found local tarball"; install_from_binary "$artifact"; return; fi
+    if artifact="$(find_binary_artifact)"; then log "Found local binary"; install_from_binary "$artifact"; return; fi
+    if src="$(find_source_dir)"; then log "Found local source"; install_from_source "$src"; return; fi
+    log "No local artifacts; attempting download."; install_from_github
+}
+
+# ===================== SERVICE INTEGRATION (part of install) ===============
+# Detect a systemd service (Cribl by default) and apply the two fixes that
+# let it spawn the setcap binary: add its account to the udp-senders group,
+# and ensure CAP_NET_RAW is in its CapabilityBoundingSet (+ ambient) via a
+# drop-in. Idempotent; silently skips when there is nothing to integrate.
+merge_caps() {
+    printf '%s %s\n' "$1" "$2" | tr ' ' '\n' | sed 's/~//g' | grep -viE '^$|^0$' \
+        | tr '[:lower:]' '[:upper:]' | awk '!seen[$0]++' | paste -sd' ' -
+}
+apply_service_integration() {
+    local SERVICE="$1" DO_RESTART="$2"
+    command -v systemctl >/dev/null 2>&1 || return 0   # no systemd: nothing to integrate
+
+    # Resolve the target unit (explicit, else auto-detect a cribl unit).
+    local unit="$SERVICE"
+    if [[ -z "$unit" ]]; then
+        unit="$(systemctl list-units --type=service --all --no-legend '*cribl*' 2>/dev/null | awk '{print $1}' | head -n1)"
+        [[ -z "$unit" ]] && unit="$(systemctl list-unit-files --no-legend '*cribl*.service' 2>/dev/null | awk '{print $1}' | head -n1)"
+    fi
+    [[ -n "$unit" ]] || return 0                       # no service: nothing to integrate
+
+    log ""
+    log "Service integration: $unit"
+    local changed=0 need_reload=0
+    local run_user bound amb
+    run_user="$(systemctl show "$unit" -p User --value 2>/dev/null || true)"
+    bound="$(systemctl show "$unit" -p CapabilityBoundingSet --value 2>/dev/null || true)"
+    amb="$(systemctl show "$unit" -p AmbientCapabilities --value 2>/dev/null || true)"
+
+    # 1. EACCES prevention: service account must be in the udp-senders group.
+    if [[ -n "$run_user" && "$run_user" != "root" ]] && id "$run_user" >/dev/null 2>&1; then
+        if id -nG "$run_user" 2>/dev/null | tr ' ' '\n' | grep -qx "$GROUP_NAME"; then
+            ok "Account '$run_user' already in '$GROUP_NAME'"
+        else
+            usermod -aG "$GROUP_NAME" "$run_user" && { ok "Added '$run_user' to '$GROUP_NAME'"; changed=1; }
+        fi
+    fi
+
+    # 2. EPERM prevention: CAP_NET_RAW in the unit's bounding set (+ ambient).
+    if [[ -z "$run_user" || "$run_user" == "root" ]]; then
+        info "Service runs as root; bounding set does not block CAP_NET_RAW"
+    elif printf '%s' "$bound" | grep -qiw "CAP_NET_RAW" || printf '%s' "$bound" | grep -qiw "cap_net_raw"; then
+        ok "Unit bounding set already includes CAP_NET_RAW"
+    else
+        local nb na dd df
+        nb="$(merge_caps "$bound" "CAP_NET_RAW")"; na="$(merge_caps "$amb" "CAP_NET_RAW")"
+        dd="/etc/systemd/system/${unit}.d"; df="${dd}/10-udp-sender-netraw.conf"
+        mkdir -p "$dd"
+        { printf '# Managed by udp-sender.sh. Grants CAP_NET_RAW so the service can spawn the setcap binary.\n'
+          printf '[Service]\n'
+          printf 'CapabilityBoundingSet=\nCapabilityBoundingSet=%s\n' "$nb"
+          printf 'AmbientCapabilities=\nAmbientCapabilities=%s\n' "$na"; } > "$df"
+        ok "Wrote drop-in: $df"; info "  bounding: $nb"; info "  ambient : $na"
+        changed=1; need_reload=1
+    fi
+
+    [[ "$need_reload" -eq 1 ]] && { systemctl daemon-reload && ok "systemd daemon reloaded"; }
+    if [[ "$changed" -eq 1 && "$DO_RESTART" -eq 1 ]]; then
+        systemctl restart "$unit" 2>/dev/null && ok "Restarted $unit" || warn "Could not restart $unit; restart it to apply."
+    elif [[ "$changed" -eq 1 ]]; then
+        warn "Changes applied; restart to activate: systemctl restart $unit"
+    fi
+}
+
+# =============================== SEND ======================================
+cmd_send() {
+    local SRC_IP="" SRC_PORT=5000 DEST_IP="" DEST_PORT="" COUNT=1 MESSAGE="Test packet"
+    local MTU=1500 IPV6=0 VERBOSE=0 SENDER="" GENERATOR="" SOURCE_DIR=""
+    local CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/udp-sender"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -s|--src-ip)    SRC_IP="${2:?}";    shift 2 ;;
+            -p|--src-port)  SRC_PORT="${2:?}";  shift 2 ;;
+            -D|--dest-ip)   DEST_IP="${2:?}";   shift 2 ;;
+            -P|--dest-port) DEST_PORT="${2:?}"; shift 2 ;;
+            -c|--count)     COUNT="${2:?}";     shift 2 ;;
+            -M|--message)   MESSAGE="${2:?}";   shift 2 ;;
+            -m|--mtu)       MTU="${2:?}";       shift 2 ;;
+            -6|--ipv6)      IPV6=1;             shift ;;
+            -v|--verbose)   VERBOSE=1;          shift ;;
+            --sender)       SENDER="${2:?}";    shift 2 ;;
+            --generator)    GENERATOR="${2:?}"; shift 2 ;;
+            --source-dir)   SOURCE_DIR="${2:?}";shift 2 ;;
+            -h|--help)      print_block; return 0 ;;
+            *) die "send: unknown option $1" ;;
+        esac
+    done
+    [[ -n "$SRC_IP"    ]] || die "send: --src-ip is required (spoofed source)."
+    [[ -n "$DEST_IP"   ]] || die "send: --dest-ip is required."
+    [[ -n "$DEST_PORT" ]] || die "send: --dest-port is required."
+    detect_arch
+
+    if [[ -z "$SENDER" ]]; then
+        if command -v udp-sender >/dev/null 2>&1; then SENDER="$(command -v udp-sender)"
+        elif [[ -x "$BINARY" ]]; then SENDER="$BINARY"
+        else die "udp-sender not found. Install it first or pass --sender PATH."; fi
+    fi
+    [[ -x "$SENDER" ]] || die "Sender '$SENDER' not executable."
+
+    if command -v getcap >/dev/null 2>&1 && ! getcap "$SENDER" 2>/dev/null | grep -q 'cap_net_raw'; then
+        log "Granting CAP_NET_RAW on $SENDER (one-time, needs root)..."
+        command -v setcap >/dev/null 2>&1 || die "setcap not found (install libcap)."
+        if [[ "$(id -u)" -eq 0 ]]; then setcap cap_net_raw+ep "$SENDER"
+        elif command -v sudo >/dev/null 2>&1; then sudo setcap cap_net_raw+ep "$SENDER"
+        else die "Run once as root: sudo setcap cap_net_raw+ep $SENDER"; fi
+    fi
+
+    local GEN; GEN="$(send_resolve_generator "$GENERATOR" "$SOURCE_DIR" "$CACHE_DIR")"
+
+    log "udp-sender spoofed send"
+    log "────────────────────────────────────────────────────────"
+    info "Sender    : $SENDER"
+    info "Generator : $GEN"
+    info "Spoofing  : ${SRC_IP}:${SRC_PORT} -> ${DEST_IP}:${DEST_PORT}"
+    info "Count     : $COUNT  MTU: $MTU  IPv6: $([[ $IPV6 -eq 1 ]] && echo yes || echo no)"
+    log "────────────────────────────────────────────────────────"
+
+    local gen_args=( -count "$COUNT" -base-ip "$SRC_IP" -base-port "$SRC_PORT" -dest-ip "$DEST_IP" -dest-port "$DEST_PORT" -message "$MESSAGE" )
+    [[ $IPV6 -eq 1 ]] && gen_args+=( -ipv6 )
+    local send_args=( -m "$MTU" ); [[ $VERBOSE -eq 1 ]] && send_args+=( -v )
+    set -o pipefail
+    "$GEN" "${gen_args[@]}" | "$SENDER" "${send_args[@]}"
+    log "────────────────────────────────────────────────────────"
+    log "Done. If packets did not arrive, check firewall / uRPF filtering."
+}
+send_build_generator() {
+    local src="$1" cache="$2" out="$2/packet-generator"
+    command -v go >/dev/null 2>&1 || die "No prebuilt generator and Go not installed; pass --generator PATH."
+    [[ -f "$src/packet-generator.go" ]] || die "packet-generator.go not in $src."
+    mkdir -p "$cache/_gen"
+    grep -v -E '^//go:build ignore|^// \+build ignore' "$src/packet-generator.go" > "$cache/_gen/main.go"
+    printf 'package main\nconst FlagIPv6 = 0x01\n' > "$cache/_gen/shim.go"
+    printf 'module packetgen\ngo 1.24\n' > "$cache/_gen/go.mod"
+    ( cd "$cache/_gen" && CGO_ENABLED=0 go build -o "$out" . )
+    printf '%s\n' "$out"
+}
+send_resolve_generator() {
+    local given="$1" srcdir="$2" cache="$3" p dir
+    if [[ -n "$given" ]]; then [[ -x "$given" ]] || die "--generator '$given' not executable."; printf '%s\n' "$given"; return; fi
+    for p in "$SCRIPT_DIR/packet-generator" "$cache/packet-generator"; do [[ -x "$p" ]] && { printf '%s\n' "$p"; return; }; done
+    command -v packet-generator >/dev/null 2>&1 && { command -v packet-generator; return; }
+    for dir in "$srcdir" "$SCRIPT_DIR/udp-sender" "$SCRIPT_DIR" "$PWD/udp-sender"; do
+        [[ -n "$dir" && -f "$dir/packet-generator.go" ]] && { send_build_generator "$dir" "$cache"; return; }
+    done
+    die "No packet-generator found. Pass --generator PATH or --source-dir with the checkout."
+}
+
+# ============================= dispatch ====================================
+COMMAND="${1:-install}"; [[ "$COMMAND" == -* ]] && COMMAND="install" || shift || true
+case "$COMMAND" in
+    install)        cmd_install "$@" ;;
+    send)           cmd_send "$@" ;;
+    help|-h|--help) print_block ;;
+    *) die "Unknown command '$COMMAND' (use: install | send | help)" ;;
+esac
